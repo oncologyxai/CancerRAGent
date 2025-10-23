@@ -9,6 +9,7 @@ st.set_page_config(
     page_title="🧬 CancerRAGent: Cancer QA Assistant",
     layout="centered",
     initial_sidebar_state="collapsed"
+    
 )
 
 # FASTAPI_URL = "http://150.65.183.91:8000/ask"   # Đổi lại nếu server FastAPI đặt chỗ khác
@@ -138,7 +139,7 @@ def save_history_to_pdf(history):
     # pdf.output("Medical_QA_History.pdf")
     # pdf_buffer.seek(0)
     # return pdf_buffer
-    pdf_bytes = pdf.output(dest='S').encode('latin-1')
+    pdf_bytes = pdf.output(dest='S').encode('utf-8')
     return pdf_bytes
 
 st.download_button(

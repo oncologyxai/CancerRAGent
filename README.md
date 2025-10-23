@@ -4,3 +4,6 @@
 - install dependency: pip install -r requirements.txt
 - run frontend by: streamlit run end2end.py
 - run backend by: uvicorn server_llm_fastapi:app --host 0.0.0.0 --port 8000
+# Note
+- For the incorporation with a ollama/vllm server, import PipelineRunner from file multi_retrieval_riken_vllm.py
+- For loading model locally, import PipelineRunner from file multi_retrieval_riken_CoT.py

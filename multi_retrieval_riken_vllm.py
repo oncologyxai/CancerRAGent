@@ -53,14 +53,6 @@ def query_vllm(prompt: str,
         str: The generated text from the model.
     """
     headers = {"Content-Type": "application/json"}
-    # FOR VLLM setup
-    # payload = {
-    #     "model": model_name,
-    #     "prompt": prompt,
-    #     "max_tokens": 512
-    # }
-
-    # FOR OLLAMA setup
     model_name="qwen2.5:7b"
     prompt_data = [
             {
@@ -87,7 +79,39 @@ def query_vllm(prompt: str,
     response = data["choices"][0]["message"]["content"].strip()
     return response
 
+def query_evaluator(
+    prompt: str,
+    model: str = "default",
+    server_url: str = OLLAMA_URL
+):
+    
+    headers = {"Content-Type": "application/json"}
+    # model_name="qwen2.5:7b"
+    model_name="shuai/Bio-Medical-Llama"
+    prompt_data = [
+            {
+                "role": "system",
+                "content": "You are a medical expert."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    payload = {
+        "model": model_name,
+        "messages": prompt_data,
+        "max_tokens": 512
+    }
 
+    response = requests.post(server_url, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
+
+    data = response.json()
+    response = data["choices"][0]["message"]["content"].strip()
+    return response
 
 
 MAX_LENGTH_FINAL_ANSWER = 256
@@ -2257,6 +2281,7 @@ class PipelineRunner:
             is_emergency,_ = self.is_red_flag_hybrid(complex_question)
             # PIPELINE
             decision = self.check_type_question(complex_question)
+            
             guided_path = self.get_exploration_path(complex_question, decision)
             
             if guided_path["alert"] is None:
