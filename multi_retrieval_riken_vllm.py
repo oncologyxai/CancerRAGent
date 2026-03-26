@@ -34,9 +34,18 @@ import nltk
 nltk.download('wordnet')
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
-
+import time
 OLLAMA_URL= "http://192.168.10.62:11434/v1/chat/completions"
+def tic():
+    return time.time()
 
+def toc(start, label=None):
+    elapsed = time.time() - start
+    if label:
+        print(f"[TIMER] {label}: {elapsed:.4f}s")
+    else:
+        print(f"[TIMER] elapsed: {elapsed:.4f}s")
+    return elapsed
 import requests
 def query_vllm(prompt: str,
                model: str = "default",
@@ -53,6 +62,14 @@ def query_vllm(prompt: str,
         str: The generated text from the model.
     """
     headers = {"Content-Type": "application/json"}
+    # FOR VLLM setup
+    # payload = {
+    #     "model": model_name,
+    #     "prompt": prompt,
+    #     "max_tokens": 512
+    # }
+
+    # FOR OLLAMA setup
     model_name="qwen2.5:7b"
     prompt_data = [
             {
@@ -79,39 +96,42 @@ def query_vllm(prompt: str,
     response = data["choices"][0]["message"]["content"].strip()
     return response
 
-def query_evaluator(
-    prompt: str,
-    model: str = "default",
-    server_url: str = OLLAMA_URL
-):
+# def query_vllm(
+#     prompt: str,
+#     model: str = "default",
+#     server_url: str = OLLAMA_URL
+# ):
     
-    headers = {"Content-Type": "application/json"}
-    # model_name="qwen2.5:7b"
-    model_name="shuai/Bio-Medical-Llama"
-    prompt_data = [
-            {
-                "role": "system",
-                "content": "You are a medical expert."
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    payload = {
-        "model": model_name,
-        "messages": prompt_data,
-        "max_tokens": 512
-    }
+#     headers = {"Content-Type": "application/json"}
+#     # model_name="qwen2.5:7b"
+#     model_name="shuai/Bio-Medical-Llama"
+#     prompt_data = [
+#             {
+#                 "role": "system",
+#                 "content": "You are a medical expert."
+#             },
+#             {
+#                 "role": "user",
+#                 "content": prompt
+#             }
+#         ]
+#     payload = {
+#         "model": model_name,
+#         "messages": prompt_data,
+#         "max_tokens": 512
+#     }
 
-    response = requests.post(server_url, headers=headers, json=payload)
+#     response = requests.post(server_url, headers=headers, json=payload)
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
+#     if response.status_code != 200:
+#         raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
 
-    data = response.json()
-    response = data["choices"][0]["message"]["content"].strip()
-    return response
+#     data = response.json()
+#     response = data["choices"][0]["message"]["content"].strip()
+#     return response
+
+
+
 
 
 MAX_LENGTH_FINAL_ANSWER = 256
@@ -213,11 +233,18 @@ class HybridRetriever:
             all_embeddings.append(embeddings.cpu().numpy())
         return np.vstack(all_embeddings)
 
+    def move_index_to_gpu(self, index):
+        res = faiss.StandardGpuResources()
+        index_gpu = faiss.index_cpu_to_gpu(res, 0, index)
+        return index_gpu
+
     def construct_index_BGE(self, metadatas, batch_size=32):
         index_path = os.path.join(self.index_dir, "pubmed_faiss_BGE_M3.index")
         if os.path.exists(index_path):
             print("[Retriever] FAISS index loaded from disk.")
-            return faiss.read_index(index_path)
+            # return faiss.read_index(index_path)
+            return self.move_index_to_gpu(faiss.read_index(index_path))
+        
         print("[Retriever] Building FAISS index...")
         def parse_metadata(line):
             try:
@@ -226,6 +253,7 @@ class HybridRetriever:
             except Exception as e:
                 return None
         num_workers = multiprocessing.cpu_count()
+
         print(f"[Retriever] Using {num_workers} CPU cores for JSON parsing")
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             parsed_data = list(executor.map(parse_metadata, metadatas))
@@ -233,25 +261,93 @@ class HybridRetriever:
         print(f"[Retriever] Total valid documents to embed: {len(data)}")
         embeddings = self.get_embeddings_bge_m3(data, batch_size=batch_size)
         dimension = embeddings.shape[1]
+    
         index = faiss.IndexFlatIP(dimension)
+
+
         index.add(embeddings)
         faiss.write_index(index, index_path)
         print(f"[Retriever] FAISS index saved to {index_path}.")
-        return index
-
+        return self.move_index_to_gpu(index)
+        # return index
+    def _bm25_score_for_doc(self, tokenized_query, doc_idx):
+        """
+        Compute BM25 score for a single document index using BM25Okapi internals.
+        This avoids computing scores over the whole corpus.
+        """
+        bm25 = self.bm25
+        score = 0.0
+        doc_len = bm25.doc_len[doc_idx]
+        avgdl = bm25.avgdl
+        k1 = bm25.k1
+        b = bm25.b
+        # doc_freqs: list of dicts mapping token->freq (depends on rank_bm25 implementation)
+        doc_freqs = bm25.doc_freqs[doc_idx]
+        for term in set(tokenized_query):
+            if term not in bm25.idf:
+                continue
+            f = doc_freqs.get(term, 0)
+            if f == 0:
+                continue
+            idf = bm25.idf.get(term, 0.0)
+            numerator = f * (k1 + 1)
+            denom = f + k1 * (1 - b + b * (doc_len / avgdl))
+            score += idf * (numerator / denom)
+        return float(score)
+        
+    # def retrieve(self, query, top_k=10):
+    #     print(f"Query: {query}\n")
+    #     tokenized_query = query.split()
+    #     print("[Retriever] Calculating BM25 scores...")
+    #     bm25_scores = self.bm25.get_scores(tokenized_query)
+    #     print("[Retriever] Calculating FAISS scores...")
+    #     query_embedding = self.get_embeddings_bge_m3([query]).reshape(1, -1)
+    #     print("[Retriever] Performing FAISS search...")
+    #     distances, indices = self.faiss_index.search(query_embedding, top_k)
+    #     faiss_scores = {idx: 1 / (1 + dist) for idx, dist in zip(indices[0], distances[0])}
+    #     bm25_scores = {i: bm25_scores[i] for i in range(len(self.metadatas))}
+        
+    #     common_indices = set(bm25_scores.keys()).intersection(faiss_scores.keys())
+    #     hybrid_scores = {
+    #         i: self.alpha * bm25_scores[i] + (1 - self.alpha) * faiss_scores[i]
+    #         for i in common_indices
+    #     }
+    #     print("[Retriever] Combining BM25 and FAISS scores...")
+    #     top_k_indices = heapq.nlargest(top_k, hybrid_scores, key=hybrid_scores.get)
+    #     return [json.loads(self.metadatas[i])['title'] + "\n" + json.loads(self.metadatas[i])['content'] for i in top_k_indices]
+    
     def retrieve(self, query, top_k=10):
         print(f"Query: {query}\n")
         tokenized_query = query.split()
-        bm25_scores = self.bm25.get_scores(tokenized_query)
+        
+        # bm25_scores = self.bm25.get_scores(tokenized_query)
+        print("[Retriever] Calculating FAISS scores...")
         query_embedding = self.get_embeddings_bge_m3([query]).reshape(1, -1)
+        print("[Retriever] Performing FAISS search...")
         distances, indices = self.faiss_index.search(query_embedding, top_k)
         faiss_scores = {idx: 1 / (1 + dist) for idx, dist in zip(indices[0], distances[0])}
-        bm25_scores = {i: bm25_scores[i] for i in range(len(self.metadatas))}
-        common_indices = set(bm25_scores.keys()).intersection(faiss_scores.keys())
-        hybrid_scores = {
-            i: self.alpha * bm25_scores[i] + (1 - self.alpha) * faiss_scores[i]
-            for i in common_indices
-        }
+        print("[Retriever] Calculating BM25 scores...")
+        # bm25_scores = {i: bm25_scores[i] for i in range(len(self.metadatas))}
+        bm25_scores_candidates = {}
+        for idx in faiss_scores.keys():
+            try:
+                bm25_scores_candidates[idx] = self._bm25_score_for_doc(tokenized_query, idx)
+            except Exception:
+                bm25_scores_candidates[idx] = 0.0
+
+        # common_indices = set(bm25_scores.keys()).intersection(faiss_scores.keys())
+        # hybrid_scores = {
+        #     i: self.alpha * bm25_scores[i] + (1 - self.alpha) * faiss_scores[i]
+        #     for i in common_indices
+        # }
+
+        hybrid_scores = {}
+        for idx in faiss_scores:
+            bm25_s = bm25_scores_candidates.get(idx, 0.0)
+            faiss_s = faiss_scores.get(idx, 0.0)
+            hybrid_scores[idx] = self.alpha * bm25_s + (1.0 - self.alpha) * faiss_s
+
+        print("[Retriever] Combining BM25 and FAISS scores...")
         top_k_indices = heapq.nlargest(top_k, hybrid_scores, key=hybrid_scores.get)
         return [json.loads(self.metadatas[i])['title'] + "\n" + json.loads(self.metadatas[i])['content'] for i in top_k_indices]
 
@@ -286,13 +382,13 @@ class AnswerVerifier:
     def __init__(self, model_name='facebook/bart-large-mnli', device=None):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         if cache_dir == "":
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True, use_safetensors=True).to(device).eval()
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True, use_safetensors=True,  max_length =512 ).to(device).eval()
         else:
-            self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True, use_safetensors=True, cache_dir="/SSD_data1/shared/huggingface_models/cache").to(device).eval()
+            self.model = AutoModelForSequenceClassification.from_pretrained(model_name, trust_remote_code=True, use_safetensors=True,  max_length =512, cache_dir="/SSD_data1/shared/huggingface_models/cache").to(device).eval()
         self.label_mapping = {0: "contradiction", 1: "neutral", 2: "entailment"}
 
     def verify(self, premise, hypothesis):
-        inputs = self.tokenizer(premise, hypothesis, return_tensors="pt", padding=True,truncation=True).to(device)
+        inputs = self.tokenizer(premise, hypothesis, return_tensors="pt", padding=True,max_length =512,truncation=True).to(device)
         with torch.no_grad():
             logits = self.model(**inputs).logits
         probabilities = torch.softmax(logits, dim=-1).cpu().numpy()[0]
@@ -996,7 +1092,7 @@ class LLMAnsweringQuestion:
         self.decompose_prompt_template = """
 You are a helpful assistant designed to break down complex cancer-related medical queries.
 
-Your task is to simplify a given question into multiple independent sub-questions. 
+Your task is to simplify a given question into multiple independent sub-questions (limit at 3 sub-questions). 
 - If the input query contains multiple parts (e.g., different conditions, treatments, comparisons), separate each into its own question.
 - If the query is already simple and focused on a single aspect, keep it as-is.
 
@@ -1018,7 +1114,7 @@ Decomposed Questions:
 - How effective is chemotherapy for pancreatic cancer?
 - What are the side effects of chemotherapy for pancreatic cancer?
 
-Now process the following:
+Now process the following remember to limit to maximum 3 sub-questions:
 Query: {question}
 Decomposed Questions:
 <RESPONSE>
@@ -1090,6 +1186,80 @@ Answer: No. This is a general question about medical information, not an emergen
 Now analyze the following:
 Question: {question}
 Answer:
+<RESPONSE>
+        """
+        self.type_question_template_n_red_flag = """      
+You are a careful, experienced medical triage assistant.
+
+TASK
+Classify the user’s question into exactly one of four types and, if Type 4, identify emergency indicators and rationale (without using Yes/No).
+
+TYPES
+- Type 1 — Basic Information:
+  General, factual, or definitional questions about diseases, symptoms, treatments, or medical concepts. Not about a specific person’s situation.
+  Examples:
+    • What is liver cancer?
+    • How many stages of liver cancer are there?
+    • What are the symptoms of lung cancer?
+    • What treatments are available for breast cancer?
+
+- Type 2 — Decision-Oriented:
+  Asks for a recommendation, comparison, or judgment/choice between options (e.g., “best”, “compare”, “should”, “which is more effective”).
+  Examples:
+    • What is the best treatment for liver cancer?
+    • Compare chemotherapy and immunotherapy for colon cancer.
+    • Should a patient with stage II lung cancer undergo surgery?
+    • Which is more effective: surgery or radiation for prostate cancer?
+
+- Type 3 — Personal Symptom Inquiry:
+  About the user’s or a specific person’s symptoms/health concerns (uses “I/my/we/our/my mother/friend/etc.”) without emergency indicators.
+  Examples:
+    • I have had blood in my stool for a week, should I be worried?
+    • My father has had a persistent cough for three weeks, should he see a doctor?
+    • I have a lump in my breast, what should I do?
+    • I am experiencing chest pain and shortness of breath. What should I do?  (→ If emergency features present, classify as Type 4 instead.)
+
+- Type 4 — Red-Flag (Possible Urgent or Life-Threatening):
+  Personal-symptom questions that indicate a potential emergency requiring urgent evaluation.
+  If Type 4, provide:
+    • Triggers: quote the exact word(s)/phrase(s) indicating an emergency.
+    • Rationale: brief explanation referencing widely used triage criteria (e.g., signs/symptoms consistent with urgent referral such as in NICE NG12).
+  Examples:
+    Q: My sister is having severe chest pain and trouble breathing, what should she do?
+    Triggers: “severe chest pain”, “trouble breathing”.
+    Rationale: Cardiac/pulmonary emergency features; urgent assessment recommended (e.g., NICE NG12 red flags).
+
+    Q: My brother is vomiting blood. Should he go to the hospital?
+    Triggers: “vomiting blood” (haematemesis).
+    Rationale: Alarm GI symptom requiring urgent evaluation (e.g., NICE NG12).
+
+    Q: My friend has noticed blood in her stool for several days. Should she be worried?
+    Triggers: “blood in stool for several days” (rectal bleeding).
+    Rationale: Urgent colorectal assessment indicated (e.g., NICE NG12).
+
+    Q: My sister has been losing weight rapidly without trying. Is this dangerous?
+    Triggers: “rapid, unintentional weight loss”.
+    Rationale: Non–site-specific red flag; urgent pathway referral (e.g., NICE NG12).
+
+    Q: My aunt suddenly had a seizure and is confused. What should she do?
+    Triggers: “suddenly had a seizure”, “is confused”.
+    Rationale: Acute neurological deficit; urgent imaging/assessment (e.g., NICE NG12).
+
+IMPORTANT RULES
+- Only classify as Type 3 if it’s about a specific person’s symptoms WITHOUT red-flag features.
+- Classify as Type 2 if the main intent is a recommendation/decision, even if medical terms are present.
+- General “what are the symptoms of X?” (no specific person) → Type 1.
+- Any personal-symptom question with red-flag features → Type 4 (not Type 3).
+
+OUTPUT FORMAT
+Respond with the following fields exactly:
+
+Type: <1|2|3|4>
+Triggers: <If Type 4: quote the exact trigger phrase(s). Otherwise: “N/A”.>
+Reason: <If Type 4: brief rationale referencing urgent indicators. Otherwise: brief reason why this is not an emergency.>
+
+Now analyze the following:
+Question: {question}
 <RESPONSE>
         """
 
@@ -2006,7 +2176,7 @@ class LLMEvaluator:
         print(f"\nBERTScore:    {avg(self.bertscore_scores):.4f}")
         print("\n================================\n")
         prefix_model_name = self.model_name.split("/")[1]
-        with open(f"INDEX/evaluation_report_{prefix_model_name}_{generator_llm_name.replace('/','_')}.txt", "w") as f:
+        with open(f"RIKEN/evaluation_report_{prefix_model_name}_{generator_llm_name.replace('/','_')}.txt", "w") as f:
             f.write("==== LLM Evaluation Report ====\n")
             f.write("\n==== Generated Answer ====\n")
             f.write(f"Evaluated Examples: {len(self.correctness_scores)}\n")
@@ -2067,7 +2237,7 @@ class PipelineRunner:
     def __init__(self, lazy_load=True):
         print("\n[Pipeline] Initializing components...")
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.index_dir = "INDEX"
+        self.index_dir = "RIKEN"
         self.lazy_load = lazy_load
         self.history = []  
         # self.generator_llm_name = "Qwen/Qwen2.5-14B-Instruct"
@@ -2170,12 +2340,22 @@ class PipelineRunner:
         flow from that step's group to the end, formatted as a string of unique group names.
         """
         # 1. Urgent symptom case
+        if "4" in question_type:
+
+            return {
+                "alert": "This symptom may require urgent medical attention. Please visit a hospital or healthcare provider immediately.",
+                "current_step": None,
+                "current_group": None,
+                "flow_steps_string": "",
+                "red_flag": True,
+            }
         if "3" in question_type:
             return {
                 "alert": "This symptom may require urgent medical attention. Please visit a hospital or healthcare provider immediately.",
                 "current_step": None,
                 "current_group": None,
                 "flow_steps_string": "",
+                "red_flag": False,
             }
 
         # 2. Cancer type extraction
@@ -2186,6 +2366,7 @@ class PipelineRunner:
                 "current_step": None,
                 "current_group": None,
                 "flow_steps_string": "",
+                "red_flag": False,
             }
 
         # 3. Prepare pathway steps (preserve order)
@@ -2222,6 +2403,7 @@ class PipelineRunner:
                 "current_step": items[best_idx][1],
                 "current_group": items[best_idx][0],
                 "flow_steps_string": flow_steps_string,
+                "red_flag": False,
             }
 
         # If no strong match, fallback: show full group pathway for orientation
@@ -2278,16 +2460,38 @@ class PipelineRunner:
             return response
         else:
             # RED FLAG
-            is_emergency,_ = self.is_red_flag_hybrid(complex_question)
-            # PIPELINE
+            # is_emergency,_ = self.is_red_flag_hybrid(complex_question)
+
+            # # PIPELINE
+            start_time = tic()
             decision = self.check_type_question(complex_question)
             
             guided_path = self.get_exploration_path(complex_question, decision)
-            
+            is_emergency = guided_path.get("red_flag", False)
             if guided_path["alert"] is None:
                 guided_path = guided_path["flow_steps_string"]
             else:
                 guided_path = guided_path["alert"]
+
+            if is_emergency:
+                response = {
+                    "answer": "Your symptoms may require urgent medical attention. Please visit a hospital or healthcare provider immediately.",
+                    "label": "emergency",
+                    "guided_path": guided_path,
+                    "question_type": decision,
+                    "confidence": 1,
+                    "confidence_percent": 100,
+                    "next_questions": "",
+                    "sub_questions": "",
+                    "sub_answers": "",
+                    "red_flag": is_emergency,
+                    "question": complex_question,
+                    "history_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                }
+                self.history.append(response)
+                return response
+
+            
             
             sub_questions = self.llm_generator.decompose(complex_question)
             sub_answers, qa_pairs_text = self.collect_sub_answers(sub_questions)
@@ -2311,11 +2515,11 @@ class PipelineRunner:
                 "sub_questions": sub_questions,
                 "sub_answers": sub_answers,
                 "red_flag": is_emergency,
-                "guided_path": guided_path,
                 "question": complex_question,
                 "history_time": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             self.history.append(response)
+            toc(start_time, label="Multi-Retrieval Response Time")
             return response
 
 
@@ -2336,7 +2540,7 @@ class PipelineRunner:
         return sub_answers, qa_pairs_text
 
     def check_type_question(self, complex_question):
-        prompt = self.llm_generator.type_question_template.format(
+        prompt = self.llm_generator.type_question_template_n_red_flag.format(
             question=complex_question,
         )
         if self.llm_generator.is_llama == False:
@@ -2455,10 +2659,10 @@ class PipelineRunner:
         prefix_model_name = self.evaluator.model_name.split("/")[1]
         generator_llm_name = self.generator_llm_name.replace("/", "_")
         if zero_shot == True:
-            output_file_path = f"INDEX/generated_answers_from_{generator_llm_name}_zero_shot.json"
+            output_file_path = f"RIKEN/generated_answers_from_{generator_llm_name}_zero_shot.json"
         else:
-            output_file_path = f"INDEX/generated_answers_from_{generator_llm_name}.json"
-
+            output_file_path = f"RIKEN/generated_answers_from_{generator_llm_name}.json"
+            
         resutls, cnt = self.check_and_count_results(output_file_path)
         print(f"\n[Pipeline] Already processed {cnt} questions. Continuing from there...")
         total_item = len(data)

@@ -9,11 +9,11 @@ st.set_page_config(
     page_title="🧬 CancerRAGent: Cancer QA Assistant",
     layout="centered",
     initial_sidebar_state="collapsed"
-    
 )
 
 # FASTAPI_URL = "http://150.65.183.91:8000/ask"   # Đổi lại nếu server FastAPI đặt chỗ khác
 FASTAPI_URL = "http://localhost:8000/ask"   # Đổi lại nếu server FastAPI đặt chỗ khác
+# FASTAPI_URL = "http://192.168.10.62:8000/ask"   # Đổi lại nếu server FastAPI đặt chỗ khác
 
 def ask_pipeline_api(question):
     try:
@@ -128,7 +128,9 @@ for idx, item in enumerate(st.session_state["history"]):
 def save_history_to_pdf(history):
     pdf = FPDF()
     pdf.add_page()
-    pdf.set_font("Arial", size=12)
+    # pdf.set_font("Arial", size=12)
+    pdf.add_font("DejaVu", "", "DejaVuSans.ttf", uni=True)
+    pdf.set_font("DejaVu", size=14)
     for idx, item in enumerate(history):
         pdf.cell(0, 10, f"Q{idx+1}: {item['question']}", ln=1)
         pdf.multi_cell(0, 10, f"A: {item['answer']}")
@@ -139,8 +141,15 @@ def save_history_to_pdf(history):
     # pdf.output("Medical_QA_History.pdf")
     # pdf_buffer.seek(0)
     # return pdf_buffer
-    pdf_bytes = pdf.output(dest='S').encode('utf-8')
-    return pdf_bytes
+    # pdf_bytes = pdf.output(dest='S').encode('latin1', 'replace')
+    pdf_bytes = pdf.output(dest='S')
+    # pdf_bytes = pdf.output(dest='S').encode('utf-8')
+    if isinstance(pdf_bytes, str):
+        # nếu là str thì mã hoá utf-8 (hiếm khi cần nếu fpdf2 đúng version)
+        pdf_bytes = pdf_bytes.encode("utf-8")
+    if isinstance(pdf_bytes, bytearray):
+        pdf_bytes = bytes(pdf_bytes)
+    return pdf_bytesppp
 
 st.download_button(
         label="Download Medical QA History (PDF)",
